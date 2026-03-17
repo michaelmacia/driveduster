@@ -2,7 +2,8 @@
 
 Windows desktop app for visualizing directory sizes and finding what's eating your disk space.
 
-![screenshot placeholder](docs/screenshot.png)
+<img width="1002" height="672" alt="image" src="https://github.com/user-attachments/assets/22cc0382-be4d-4cdb-88c2-945f6a032fe4" />
+
 
 ## Download
 
