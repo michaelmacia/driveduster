@@ -15,7 +15,8 @@ Grab the latest `DriveDuster.exe` from [Releases](../../releases/latest) — no 
 - **◀ Back / ▲ Up** to navigate back up the tree
 - **Drive dropdown** to switch drives
 - **Click column headers** to sort
-- **Right-click** a row to open in Explorer or copy the path
+- **Right-click** a row to open in Explorer, copy the path, delete the folder, or uninstall the application
+- **Drag column borders** to resize columns
 
 ## Build from source
 
