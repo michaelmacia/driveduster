@@ -1,0 +1,2 @@
+# Dev/build only — end users just run DriveDuster.exe
+pyinstaller>=6.0
