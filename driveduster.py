@@ -13,6 +13,10 @@ from tkinter import messagebox, ttk
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Sentinel prefix for placeholder "Scanning…" children
+_DUMMY = "\x00dummy\x00"
+
+
 def get_dir_size(path: Path) -> int:
     total = 0
     try:
@@ -27,6 +31,26 @@ def get_dir_size(path: Path) -> int:
     except (PermissionError, OSError):
         pass
     return total
+
+
+def scan_children(path: Path) -> list[tuple[Path, int]]:
+    """Return immediate subdirectories of path with their recursive sizes, sorted largest first."""
+    results = []
+    try:
+        entries = [e for e in os.scandir(path) if e.is_dir(follow_symlinks=False)]
+    except (PermissionError, OSError):
+        return []
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futures = {ex.submit(get_dir_size, Path(e.path)): e for e in entries}
+        for future in as_completed(futures):
+            try:
+                results.append((Path(futures[future].path), future.result()))
+            except Exception:
+                pass
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
 
 
 def format_size(size_bytes: int) -> str:
@@ -60,20 +84,16 @@ class DriveDusterApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("DriveDuster")
-        self.root.geometry("1000x620")
+        self.root.geometry("1000x640")
         self.root.minsize(640, 420)
 
         self.current_path = Path("C:\\")
-        self.history: list[Path] = []
-        self.scan_results: list[tuple[Path, int]] = []
-        self._scanning = False
-        self._cancel = False
-        self._sort_col = "size"
-        self._sort_desc = True
+        self._root_gen = 0          # incremented on each root rescan to discard stale results
+        self._expanding: set[str] = set()  # iids currently being scanned on expand
 
         self._build_ui()
         self._apply_style()
-        self.navigate_to(self.current_path, add_history=False)
+        self._rescan()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -87,7 +107,7 @@ class DriveDusterApp:
         s.configure("Treeview", rowheight=26, font=("Segoe UI", 10))
         s.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
         s.configure("Status.TLabel", font=("Segoe UI", 9), foreground="#555555")
-        s.configure("Path.TEntry", font=("Segoe UI", 10))
+        s.configure("Dummy.TLabel", foreground="#aaaaaa")
 
     def _build_ui(self):
         # ── Toolbar ───────────────────────────────────────────────
@@ -106,14 +126,7 @@ class DriveDusterApp:
             self.drive_var.set(drives[0])
         self.drive_combo.bind("<<ComboboxSelected>>", self._on_drive_change)
 
-        self.btn_back = ttk.Button(bar, text="◀", width=3, command=self._go_back)
-        self.btn_back.pack(side="left", padx=(0, 2))
-        self.btn_back.state(["disabled"])
-
-        self.btn_up = ttk.Button(bar, text="▲", width=3, command=self._go_up)
-        self.btn_up.pack(side="left", padx=(0, 8))
-
-        self.path_var = tk.StringVar()
+        self.path_var = tk.StringVar(value=str(self.current_path))
         path_entry = ttk.Entry(bar, textvariable=self.path_var)
         path_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         path_entry.bind("<Return>", self._on_path_enter)
@@ -128,40 +141,35 @@ class DriveDusterApp:
         cols = ("size", "pct", "bar")
         self.tree = ttk.Treeview(body, columns=cols, selectmode="browse")
 
-        self.tree.heading("#0",    text=" Directory",  anchor="w",
-                          command=lambda: self._sort("name"))
-        self.tree.heading("size",  text="Size",        anchor="e",
-                          command=lambda: self._sort("size"))
-        self.tree.heading("pct",   text="% of total",  anchor="e",
-                          command=lambda: self._sort("pct"))
-        self.tree.heading("bar",   text="Usage",       anchor="w")
+        self.tree.heading("#0",   text=" Directory", anchor="w")
+        self.tree.heading("size", text="Size",       anchor="e")
+        self.tree.heading("pct",  text="% of parent", anchor="e")
+        self.tree.heading("bar",  text="Usage",      anchor="w")
 
         self.tree.column("#0",   stretch=True, minwidth=220)
         self.tree.column("size", width=100, anchor="e", stretch=False)
-        self.tree.column("pct",  width=90,  anchor="e", stretch=False)
+        self.tree.column("pct",  width=100, anchor="e", stretch=False)
         self.tree.column("bar",  width=210, anchor="w", stretch=False)
 
         self.tree.tag_configure("huge",   foreground="#c0392b")
         self.tree.tag_configure("large",  foreground="#e67e22")
         self.tree.tag_configure("medium", foreground="#27ae60")
         self.tree.tag_configure("small",  foreground="#888888")
+        self.tree.tag_configure("dummy",  foreground="#aaaaaa")
 
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
 
-        self.tree.bind("<Double-1>",    self._on_double_click)
-        self.tree.bind("<Return>",      self._on_double_click)
-        self.tree.bind("<Button-3>",    self._on_right_click)
-        self.tree.bind("<BackSpace>",   lambda _: self._go_back())
+        self.tree.bind("<<TreeviewOpen>>", self._on_expand)
+        self.tree.bind("<Button-3>",       self._on_right_click)
 
         # ── Context menu ──────────────────────────────────────────
         self.ctx = tk.Menu(self.root, tearoff=0)
-        self.ctx.add_command(label="Open in Explorer",  command=self._open_explorer)
-        self.ctx.add_command(label="Drill into folder", command=self._drill_selected)
+        self.ctx.add_command(label="Open in Explorer", command=self._open_explorer)
         self.ctx.add_separator()
-        self.ctx.add_command(label="Copy path",         command=self._copy_path)
+        self.ctx.add_command(label="Copy path", command=self._copy_path)
 
         # ── Status bar ────────────────────────────────────────────
         sf = ttk.Frame(self.root, padding=(6, 2, 6, 4))
@@ -173,146 +181,116 @@ class DriveDusterApp:
         self.progress = ttk.Progressbar(sf, mode="indeterminate", length=130)
         self.progress.pack(side="right")
 
-    # ── Navigation ────────────────────────────────────────────────────────────
-
-    def navigate_to(self, path: Path, add_history: bool = True):
-        if add_history and path != self.current_path:
-            self.history.append(self.current_path)
-        self.current_path = path
-        self.path_var.set(str(path))
-        self.btn_back.state(["!disabled"] if self.history else ["disabled"])
-        self._start_scan()
-
-    def _go_back(self):
-        if self.history:
-            self.navigate_to(self.history.pop(), add_history=False)
-            self.btn_back.state(["!disabled"] if self.history else ["disabled"])
-
-    def _go_up(self):
-        parent = self.current_path.parent
-        if parent != self.current_path:
-            self.navigate_to(parent)
+    # ── Root scan ─────────────────────────────────────────────────────────────
 
     def _rescan(self):
-        self.navigate_to(self.current_path, add_history=False)
-
-    def _on_drive_change(self, _=None):
-        drive = self.drive_var.get()
-        if drive:
-            self.navigate_to(Path(drive))
-
-    def _on_path_enter(self, _=None):
-        p = Path(self.path_var.get().strip())
-        if p.is_dir():
-            self.navigate_to(p)
-        else:
-            messagebox.showerror("Invalid path", f"Directory not found:\n{p}")
-
-    # ── Scanning ──────────────────────────────────────────────────────────────
-
-    def _start_scan(self):
-        if self._scanning:
-            self._cancel = True
-        self._scanning = True
-        self._cancel = False
+        self._root_gen += 1
+        gen = self._root_gen
         self._clear_tree()
         self.btn_scan.state(["disabled"])
         self.status_var.set(f"Scanning {self.current_path} …")
         self.progress.start(8)
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(
+            target=self._root_worker, args=(self.current_path, gen), daemon=True
+        ).start()
 
-    def _scan_worker(self):
-        path = self.current_path
-        results: list[tuple[Path, int]] = []
+    def _root_worker(self, path: Path, gen: int):
+        results = scan_children(path)
+        if gen == self._root_gen:
+            self.root.after(0, self._on_root_done, results, gen)
 
-        try:
-            entries = [e for e in os.scandir(path) if e.is_dir(follow_symlinks=False)]
-        except (PermissionError, OSError):
-            entries = []
-
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            futures = {ex.submit(get_dir_size, Path(e.path)): e for e in entries}
-            for future in as_completed(futures):
-                if self._cancel:
-                    return
-                entry = futures[future]
-                try:
-                    size = future.result()
-                    results.append((Path(entry.path), size))
-                    self.root.after(0, self.status_var.set, f"Scanning … {entry.name}")
-                except Exception:
-                    pass
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        self.root.after(0, self._on_scan_done, results)
-
-    def _on_scan_done(self, results: list[tuple[Path, int]]):
-        self._scanning = False
+    def _on_root_done(self, results: list[tuple[Path, int]], gen: int):
+        if gen != self._root_gen:
+            return
         self.progress.stop()
         self.btn_scan.state(["!disabled"])
-        self.scan_results = results
-        self._populate_tree()
 
-    def _populate_tree(self):
-        self._clear_tree()
-        results = self.scan_results
         total = sum(s for _, s in results)
-
         for p, size in results:
-            pct = size / total * 100 if total else 0
-            self.tree.insert(
-                "", "end",
-                iid=str(p),
-                text=f"  {p.name}",
-                values=(format_size(size), f"{pct:.1f}%", f"  {make_bar(pct)}"),
-                tags=(size_tag(size),),
-            )
+            self._insert_node("", p, size, total)
 
         n = len(results)
         self.status_var.set(
             f"{n} director{'y' if n == 1 else 'ies'}  —  Total: {format_size(total)}"
         )
 
+    # ── Lazy expand ───────────────────────────────────────────────────────────
+
+    def _on_expand(self, _event=None):
+        iid = self.tree.focus()
+        if not iid or iid in self._expanding:
+            return
+
+        children = self.tree.get_children(iid)
+        # Only scan if the sole child is a placeholder
+        if len(children) == 1 and children[0].startswith(_DUMMY):
+            self._expanding.add(iid)
+            self.tree.item(children[0], text="  Scanning…")
+            threading.Thread(
+                target=self._expand_worker, args=(iid,), daemon=True
+            ).start()
+
+    def _expand_worker(self, parent_iid: str):
+        results = scan_children(Path(parent_iid))
+        self.root.after(0, self._on_expand_done, parent_iid, results)
+
+    def _on_expand_done(self, parent_iid: str, results: list[tuple[Path, int]]):
+        self._expanding.discard(parent_iid)
+
+        # Remove placeholder
+        for child in self.tree.get_children(parent_iid):
+            if child.startswith(_DUMMY):
+                self.tree.delete(child)
+
+        total = sum(s for _, s in results)
+        for p, size in results:
+            self._insert_node(parent_iid, p, size, total)
+
+    # ── Tree helpers ──────────────────────────────────────────────────────────
+
+    def _insert_node(self, parent_iid: str, path: Path, size: int, parent_total: int):
+        iid = str(path)
+        if self.tree.exists(iid):
+            return  # guard against duplicate iids on very deep trees
+
+        pct = size / parent_total * 100 if parent_total else 0
+        self.tree.insert(
+            parent_iid, "end",
+            iid=iid,
+            text=f"  {path.name}",
+            values=(format_size(size), f"{pct:.1f}%", f"  {make_bar(pct)}"),
+            tags=(size_tag(size),),
+        )
+        # Placeholder child makes the row expandable
+        self.tree.insert(iid, "end", iid=f"{_DUMMY}{iid}", text="", tags=("dummy",))
+
     def _clear_tree(self):
         self.tree.delete(*self.tree.get_children())
 
-    # ── Sorting ───────────────────────────────────────────────────────────────
+    # ── Events ────────────────────────────────────────────────────────────────
 
-    def _sort(self, col: str):
-        if self._sort_col == col:
-            self._sort_desc = not self._sort_desc
+    def _on_drive_change(self, _=None):
+        drive = self.drive_var.get()
+        if drive:
+            self.current_path = Path(drive)
+            self.path_var.set(str(self.current_path))
+            self._rescan()
+
+    def _on_path_enter(self, _=None):
+        p = Path(self.path_var.get().strip())
+        if p.is_dir():
+            self.current_path = p
+            self._rescan()
         else:
-            self._sort_col = col
-            self._sort_desc = True
-
-        lookup = {str(p): s for p, s in self.scan_results}
-
-        if col in ("size", "pct"):
-            key = lambda iid: lookup.get(iid, 0)
-        else:
-            key = lambda iid: Path(iid).name.lower()
-
-        items = sorted(self.tree.get_children(), key=key, reverse=self._sort_desc)
-        for i, iid in enumerate(items):
-            self.tree.move(iid, "", i)
-
-    # ── Tree events ───────────────────────────────────────────────────────────
+            messagebox.showerror("Invalid path", f"Directory not found:\n{p}")
 
     def _selected_path(self) -> Path | None:
         sel = self.tree.selection()
-        return Path(sel[0]) if sel else None
-
-    def _drill_selected(self):
-        p = self._selected_path()
-        if p and p.is_dir():
-            self.navigate_to(p)
-
-    def _on_double_click(self, _=None):
-        self._drill_selected()
+        return Path(sel[0]) if sel and not sel[0].startswith(_DUMMY) else None
 
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
-        if row:
+        if row and not row.startswith(_DUMMY):
             self.tree.selection_set(row)
             self.ctx.post(event.x_root, event.y_root)
 

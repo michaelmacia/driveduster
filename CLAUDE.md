@@ -23,15 +23,22 @@ build.bat
 
 Everything lives in `driveduster.py`:
 
-- **`get_dir_size(path)`** — recursive size calculation; swallows `PermissionError`/`OSError` silently so restricted folders don't break the scan.
+- **`get_dir_size(path)`** — recursive size calculation; swallows `PermissionError`/`OSError` silently.
+- **`scan_children(path)`** — scans immediate subdirectories of a path using a 16-worker `ThreadPoolExecutor`, returns results sorted largest-first.
 - **`DriveDusterApp`** — single class containing the full UI and scan logic.
-  - `navigate_to()` is the central navigation method; all drive/path/back/up/double-click actions funnel through it.
-  - `_start_scan()` → `_scan_worker()` (background thread, 16-worker `ThreadPoolExecutor`) → `_on_scan_done()` (back on main thread via `root.after`). The `_cancel` flag aborts in-flight scans when a new navigation happens.
-  - `_populate_tree()` renders results into the `ttk.Treeview`; call it again after sorting to re-render.
+
+## Tree / lazy-loading model
+
+The `ttk.Treeview` is hierarchical. Every inserted directory node gets a sentinel placeholder child (`_DUMMY` prefix iid) so the expand arrow appears. When the user expands a node (`<<TreeviewOpen>>`):
+
+1. `_on_expand()` detects the placeholder child and starts a background thread.
+2. `_expand_worker()` calls `scan_children()` for that node's path.
+3. `_on_expand_done()` (main thread via `root.after`) removes the placeholder and inserts real children, each with their own placeholder.
+
+Root-level scans use a `_root_gen` integer counter. When a new root scan starts the counter increments; stale workers compare their captured `gen` against `self._root_gen` and discard results if they don't match. Node-expansion scans are tracked in `self._expanding: set[str]` to prevent double-scanning.
 
 ## Key behaviours
 
-- Scanning runs on a daemon thread; UI stays responsive. Results are posted back with `root.after(0, ...)`.
-- A new navigation while a scan is in progress sets `self._cancel = True`; the worker checks this flag between futures and exits early.
-- Column header clicks toggle sort direction; sort state is stored in `_sort_col` / `_sort_desc`.
+- `% of parent` column shows size relative to the sibling group total at each level.
 - Color tags (`huge`/`large`/`medium`/`small`) are applied per-row based on GB thresholds (10 / 1 / 0.1 GB).
+- Right-clicking a row opens a context menu; clicking the placeholder row is ignored.
