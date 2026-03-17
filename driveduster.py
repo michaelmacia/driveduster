@@ -2,6 +2,7 @@
 """DriveDuster - Directory size analyzer (Windows desktop app)."""
 
 import os
+import shutil
 import string
 import subprocess
 import threading
@@ -72,6 +73,16 @@ def size_tag(size: int) -> str:
     if gb >= 1:   return "large"
     if gb >= 0.1: return "medium"
     return "small"
+
+
+def find_uninstaller(path: Path) -> Path | None:
+    """Return the first uninstaller executable found directly inside path, or None."""
+    patterns = ["unins*.exe", "uninstall*.exe", "uninst*.exe", "*uninstall*.exe"]
+    for pattern in patterns:
+        for match in path.glob(pattern):
+            if match.is_file():
+                return match
+    return None
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -171,9 +182,11 @@ class DriveDusterApp:
 
         # ── Context menu ──────────────────────────────────────────
         self.ctx = tk.Menu(self.root, tearoff=0)
-        self.ctx.add_command(label="Open in Explorer", command=self._open_explorer)
+        self.ctx.add_command(label="Open in Explorer",      command=self._open_explorer)
+        self.ctx.add_command(label="Copy path",             command=self._copy_path)
         self.ctx.add_separator()
-        self.ctx.add_command(label="Copy path", command=self._copy_path)
+        self.ctx.add_command(label="Uninstall application", command=self._uninstall_selected)
+        self.ctx.add_command(label="Delete folder…",        command=self._delete_selected)
 
         # ── Status bar ────────────────────────────────────────────
         sf = ttk.Frame(self.root, padding=(6, 2, 6, 4))
@@ -310,6 +323,118 @@ class DriveDusterApp:
         if p:
             self.root.clipboard_clear()
             self.root.clipboard_append(str(p))
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        p = self._nodes.get(iid)
+        if not p:
+            return
+
+        size_str = self.tree.set(iid, "size")
+        if not self._confirm_delete(p, size_str):
+            return
+
+        self.status_var.set(f"Deleting {p.name} …")
+        self.progress.start(8)
+        threading.Thread(target=self._delete_worker, args=(iid, p), daemon=True).start()
+
+    def _delete_worker(self, iid: str, path: Path):
+        try:
+            shutil.rmtree(path)
+            self.root.after(0, self._on_delete_done, iid, path, None)
+        except Exception as e:
+            self.root.after(0, self._on_delete_done, iid, path, str(e))
+
+    def _on_delete_done(self, iid: str, path: Path, error: str | None):
+        self.progress.stop()
+        if error:
+            self.status_var.set("Ready")
+            messagebox.showerror("Delete failed", f"Could not delete {path.name}:\n{error}")
+            return
+
+        # Remove this node and all its descendants from _nodes, then from tree
+        self._remove_subtree(iid)
+        self.status_var.set(f"Deleted {path.name}")
+
+    def _remove_subtree(self, iid: str):
+        """Remove iid and all descendants from the tree and _nodes dict."""
+        for child in self.tree.get_children(iid):
+            self._remove_subtree(child)
+        self._nodes.pop(iid, None)
+        if self.tree.exists(iid):
+            self.tree.delete(iid)
+
+    def _confirm_delete(self, path: Path, size_str: str) -> bool:
+        """Show a custom confirmation dialog. Returns True if user confirms."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm Delete")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.focus_set()
+
+        # Center over main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() // 2 - 220
+        y = self.root.winfo_y() + self.root.winfo_height() // 2 - 90
+        dialog.geometry(f"440x180+{x}+{y}")
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Permanently delete this folder?",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(frame, text=f"  {path.name}",
+                  font=("Segoe UI", 10)).pack(anchor="w", pady=(4, 0))
+        ttk.Label(frame, text=f"  {size_str}  —  {path}",
+                  font=("Segoe UI", 9), foreground="#888").pack(anchor="w")
+        ttk.Label(frame, text="This cannot be undone.",
+                  font=("Segoe UI", 9), foreground="#c0392b").pack(anchor="w", pady=(8, 16))
+
+        confirmed = tk.BooleanVar(value=False)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(anchor="e")
+
+        def on_delete():
+            confirmed.set(True)
+            dialog.destroy()
+
+        # Style the delete button red via a tk.Button (ttk doesn't support bg colour easily)
+        tk.Button(btn_frame, text="Delete", bg="#c0392b", fg="white",
+                  activebackground="#a93226", activeforeground="white",
+                  relief="flat", padx=12, pady=4,
+                  font=("Segoe UI", 10), command=on_delete).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left")
+
+        dialog.wait_window()
+        return confirmed.get()
+
+    # ── Uninstall ─────────────────────────────────────────────────────────────
+
+    def _uninstall_selected(self):
+        p = self._selected_path()
+        if not p:
+            return
+
+        uninstaller = find_uninstaller(p)
+        if uninstaller:
+            if messagebox.askyesno(
+                "Uninstall",
+                f"Run uninstaller for {p.name}?\n\n{uninstaller.name}",
+            ):
+                subprocess.Popen([str(uninstaller)])
+        else:
+            if messagebox.askyesno(
+                "No uninstaller found",
+                f"No uninstaller was found in:\n{p}\n\n"
+                "Open Windows Apps & Features to uninstall manually?",
+            ):
+                subprocess.Popen(["explorer", "ms-settings:appsfeatures"])
 
     def run(self):
         self.root.mainloop()
