@@ -13,10 +13,6 @@ from tkinter import messagebox, ttk
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Sentinel prefix for placeholder "Scanning…" children
-_DUMMY = "\x00dummy\x00"
-
-
 def get_dir_size(path: Path) -> int:
     total = 0
     try:
@@ -34,7 +30,7 @@ def get_dir_size(path: Path) -> int:
 
 
 def scan_children(path: Path) -> list[tuple[Path, int]]:
-    """Return immediate subdirectories of path with their recursive sizes, sorted largest first."""
+    """Return immediate subdirectories with recursive sizes, sorted largest first."""
     results = []
     try:
         entries = [e for e in os.scandir(path) if e.is_dir(follow_symlinks=False)]
@@ -88,12 +84,21 @@ class DriveDusterApp:
         self.root.minsize(640, 420)
 
         self.current_path = Path("C:\\")
-        self._root_gen = 0          # incremented on each root rescan to discard stale results
-        self._expanding: set[str] = set()  # iids currently being scanned on expand
+        self._root_gen = 0
+        self._expanding: set[str] = set()
+
+        # iid is always a plain integer string ("1", "2", ...) to avoid
+        # Tcl misinterpreting backslashes or special chars in Windows paths.
+        self._iid_seq = 0
+        self._nodes: dict[str, Path] = {}   # iid  -> Path  (dummy iids absent)
 
         self._build_ui()
         self._apply_style()
         self._rescan()
+
+    def _next_iid(self) -> str:
+        self._iid_seq += 1
+        return str(self._iid_seq)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -107,7 +112,6 @@ class DriveDusterApp:
         s.configure("Treeview", rowheight=26, font=("Segoe UI", 10))
         s.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
         s.configure("Status.TLabel", font=("Segoe UI", 9), foreground="#555555")
-        s.configure("Dummy.TLabel", foreground="#aaaaaa")
 
     def _build_ui(self):
         # ── Toolbar ───────────────────────────────────────────────
@@ -141,10 +145,10 @@ class DriveDusterApp:
         cols = ("size", "pct", "bar")
         self.tree = ttk.Treeview(body, columns=cols, selectmode="browse")
 
-        self.tree.heading("#0",   text=" Directory", anchor="w")
-        self.tree.heading("size", text="Size",       anchor="e")
+        self.tree.heading("#0",   text=" Directory",  anchor="w")
+        self.tree.heading("size", text="Size",        anchor="e")
         self.tree.heading("pct",  text="% of parent", anchor="e")
-        self.tree.heading("bar",  text="Usage",      anchor="w")
+        self.tree.heading("bar",  text="Usage",       anchor="w")
 
         self.tree.column("#0",   stretch=True, minwidth=220)
         self.tree.column("size", width=100, anchor="e", stretch=False)
@@ -186,6 +190,8 @@ class DriveDusterApp:
     def _rescan(self):
         self._root_gen += 1
         gen = self._root_gen
+        self._nodes.clear()
+        self._expanding.clear()
         self._clear_tree()
         self.btn_scan.state(["disabled"])
         self.status_var.set(f"Scanning {self.current_path} …")
@@ -218,28 +224,29 @@ class DriveDusterApp:
 
     def _on_expand(self, _event=None):
         iid = self.tree.focus()
-        if not iid or iid in self._expanding:
+        if not iid or iid not in self._nodes or iid in self._expanding:
             return
 
         children = self.tree.get_children(iid)
-        # Only scan if the sole child is a placeholder
-        if len(children) == 1 and children[0].startswith(_DUMMY):
+        # Sole child absent from _nodes == placeholder
+        if len(children) == 1 and children[0] not in self._nodes:
             self._expanding.add(iid)
             self.tree.item(children[0], text="  Scanning…")
+            path = self._nodes[iid]
             threading.Thread(
-                target=self._expand_worker, args=(iid,), daemon=True
+                target=self._expand_worker, args=(iid, path), daemon=True
             ).start()
 
-    def _expand_worker(self, parent_iid: str):
-        results = scan_children(Path(parent_iid))
+    def _expand_worker(self, parent_iid: str, path: Path):
+        results = scan_children(path)
         self.root.after(0, self._on_expand_done, parent_iid, results)
 
     def _on_expand_done(self, parent_iid: str, results: list[tuple[Path, int]]):
         self._expanding.discard(parent_iid)
 
-        # Remove placeholder
+        # Remove placeholder child
         for child in self.tree.get_children(parent_iid):
-            if child.startswith(_DUMMY):
+            if child not in self._nodes:
                 self.tree.delete(child)
 
         total = sum(s for _, s in results)
@@ -249,9 +256,8 @@ class DriveDusterApp:
     # ── Tree helpers ──────────────────────────────────────────────────────────
 
     def _insert_node(self, parent_iid: str, path: Path, size: int, parent_total: int):
-        iid = str(path)
-        if self.tree.exists(iid):
-            return  # guard against duplicate iids on very deep trees
+        iid = self._next_iid()
+        self._nodes[iid] = path
 
         pct = size / parent_total * 100 if parent_total else 0
         self.tree.insert(
@@ -261,8 +267,8 @@ class DriveDusterApp:
             values=(format_size(size), f"{pct:.1f}%", f"  {make_bar(pct)}"),
             tags=(size_tag(size),),
         )
-        # Placeholder child makes the row expandable
-        self.tree.insert(iid, "end", iid=f"{_DUMMY}{iid}", text="", tags=("dummy",))
+        # Placeholder (not in _nodes) makes the row expandable
+        self.tree.insert(iid, "end", iid=self._next_iid(), text="", tags=("dummy",))
 
     def _clear_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -286,11 +292,11 @@ class DriveDusterApp:
 
     def _selected_path(self) -> Path | None:
         sel = self.tree.selection()
-        return Path(sel[0]) if sel and not sel[0].startswith(_DUMMY) else None
+        return self._nodes.get(sel[0]) if sel else None
 
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
-        if row and not row.startswith(_DUMMY):
+        if row and row in self._nodes:
             self.tree.selection_set(row)
             self.ctx.post(event.x_root, event.y_root)
 
