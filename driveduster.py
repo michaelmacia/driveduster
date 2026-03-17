@@ -97,6 +97,7 @@ class DriveDusterApp:
         self.current_path = Path("C:\\")
         self._root_gen = 0
         self._expanding: set[str] = set()
+        self._disk_total: int = 1  # total bytes on the current drive (set on each root scan)
 
         # iid is always a plain integer string ("1", "2", ...) to avoid
         # Tcl misinterpreting backslashes or special chars in Windows paths.
@@ -153,18 +154,20 @@ class DriveDusterApp:
         body = ttk.Frame(self.root, padding=(6, 0, 6, 0))
         body.pack(fill="both", expand=True)
 
-        cols = ("size", "pct", "bar")
+        cols = ("size", "pct", "disk_pct", "bar")
         self.tree = ttk.Treeview(body, columns=cols, selectmode="browse")
 
-        self.tree.heading("#0",   text=" Directory",  anchor="w")
-        self.tree.heading("size", text="Size",        anchor="e")
-        self.tree.heading("pct",  text="% of parent", anchor="e")
-        self.tree.heading("bar",  text="Usage",       anchor="w")
+        self.tree.heading("#0",       text=" Directory",  anchor="w")
+        self.tree.heading("size",     text="Size",        anchor="e")
+        self.tree.heading("pct",      text="% of parent", anchor="e")
+        self.tree.heading("disk_pct", text="% of disk",   anchor="e")
+        self.tree.heading("bar",      text="Usage",       anchor="w")
 
-        self.tree.column("#0",   stretch=True, minwidth=220)
-        self.tree.column("size", width=100, anchor="e", stretch=False)
-        self.tree.column("pct",  width=100, anchor="e", stretch=False)
-        self.tree.column("bar",  width=210, anchor="w", stretch=False)
+        self.tree.column("#0",       stretch=False, minwidth=120, width=300)
+        self.tree.column("size",     stretch=False, width=100, anchor="e")
+        self.tree.column("pct",      stretch=False, width=95,  anchor="e")
+        self.tree.column("disk_pct", stretch=False, width=95,  anchor="e")
+        self.tree.column("bar",      stretch=False, width=200, anchor="w")
 
         self.tree.tag_configure("huge",   foreground="#c0392b")
         self.tree.tag_configure("large",  foreground="#e67e22")
@@ -179,6 +182,7 @@ class DriveDusterApp:
 
         self.tree.bind("<<TreeviewOpen>>", self._on_expand)
         self.tree.bind("<Button-3>",       self._on_right_click)
+        self.tree.bind("<Configure>",      self._fit_dir_column)
 
         # ── Context menu ──────────────────────────────────────────
         self.ctx = tk.Menu(self.root, tearoff=0)
@@ -215,14 +219,17 @@ class DriveDusterApp:
 
     def _root_worker(self, path: Path, gen: int):
         results = scan_children(path)
+        disk = shutil.disk_usage(path)
         if gen == self._root_gen:
-            self.root.after(0, self._on_root_done, results, gen)
+            self.root.after(0, self._on_root_done, results, disk.total, disk.free, gen)
 
-    def _on_root_done(self, results: list[tuple[Path, int]], gen: int):
+    def _on_root_done(self, results: list[tuple[Path, int]], disk_total: int, disk_free: int, gen: int):
         if gen != self._root_gen:
             return
         self.progress.stop()
         self.btn_scan.state(["!disabled"])
+
+        self._disk_total = disk_total or 1
 
         total = sum(s for _, s in results)
         for p, size in results:
@@ -230,7 +237,10 @@ class DriveDusterApp:
 
         n = len(results)
         self.status_var.set(
-            f"{n} director{'y' if n == 1 else 'ies'}  —  Total: {format_size(total)}"
+            f"{n} director{'y' if n == 1 else 'ies'}  —  "
+            f"Scanned: {format_size(total)}  |  "
+            f"Disk: {format_size(disk_total - disk_free)} used of {format_size(disk_total)} "
+            f"({format_size(disk_free)} free)"
         )
 
     # ── Lazy expand ───────────────────────────────────────────────────────────
@@ -272,16 +282,23 @@ class DriveDusterApp:
         iid = self._next_iid()
         self._nodes[iid] = path
 
-        pct = size / parent_total * 100 if parent_total else 0
+        pct       = size / parent_total    * 100 if parent_total    else 0
+        disk_pct  = size / self._disk_total * 100 if self._disk_total else 0
         self.tree.insert(
             parent_iid, "end",
             iid=iid,
             text=f"  {path.name}",
-            values=(format_size(size), f"{pct:.1f}%", f"  {make_bar(pct)}"),
+            values=(format_size(size), f"{pct:.1f}%", f"{disk_pct:.2f}%", f"  {make_bar(pct)}"),
             tags=(size_tag(size),),
         )
         # Placeholder (not in _nodes) makes the row expandable
         self.tree.insert(iid, "end", iid=self._next_iid(), text="", tags=("dummy",))
+
+    def _fit_dir_column(self, _event=None):
+        fixed = sum(self.tree.column(c, "width") for c in ("size", "pct", "disk_pct", "bar"))
+        available = self.tree.winfo_width() - fixed - 20  # 20 for scrollbar
+        if available > 120:
+            self.tree.column("#0", width=available)
 
     def _clear_tree(self):
         self.tree.delete(*self.tree.get_children())
